@@ -1,0 +1,35 @@
+# Build trees
+/build/
+/out/
+/install/
+/_build/
+CMakeUserPresets.json
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.VC.db
+*.vcxproj*
+
+# Local runtime state produced by the tools (never committed)
+/run/
+/logs/
+*.cflog
+*.cfsnap
+*.cfmeta
+*.part
+*.tmp
+
+# Crash / diagnostic debris
+*.dmp
+*.pdb
+*.ilk
+*.log
+core
+
+# Downstream consumer build output
+/examples/**/build/
+/examples/**/out/
