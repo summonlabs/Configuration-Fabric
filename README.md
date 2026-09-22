@@ -112,11 +112,11 @@ were not proven are listed there as UNSUPPORTED.
 
 Measured on the development host (Windows 11 x64, MSVC 19.44, loopback TCP):
 
-| Benchmark | Result |
+| Benchmark | Result (three runs) |
 |---|---|
-| Artifact store (publish + re-read + verify) | ~21 MB/s of verified bytes |
-| Framing (encode + decode round trip) | ~270 MB/s |
-| End-to-end delivery (controller → agent → acknowledged) | 32/32 deliveries, ~14 deliveries/s |
+| Artifact store (publish + re-read + verify) | 21–39 MB/s of verified bytes |
+| Framing (encode + decode round trip) | 270–282 MB/s |
+| End-to-end delivery (controller → agent → acknowledged) | 32/32 deliveries every run, 14–18 deliveries/s |
 
 Benchmarks measure completed work - verified bytes and acknowledged deliveries -
 never submission latency.
