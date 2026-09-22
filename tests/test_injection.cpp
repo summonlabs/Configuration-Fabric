@@ -376,12 +376,23 @@ CF_TEST(injection, withheld_acknowledgement_is_resolved_by_reconciliation) {
     return;
   }
   std::string output;
-  const bool applied = cf::test::waitForConvergence(
+  // The controller never waits for the acknowledgement, so the delivery settles
+  // at "applied". A reconcile session may resolve it in the meantime, which is
+  // equally correct; what must never happen is a converged claim without
+  // reconciliation evidence backing it.
+  (void)cf::test::waitForConvergence(
       controller->endpoint(), fixture.keyFile,
-      [](const std::string& text) { return cf::test::containsText(text, "state=applied"); },
-      &output);
-  CF_EXPECT_MSG(applied, output + controller->logText() + agent->logText());
-  CF_EXPECT(!cf::test::containsText(output, "state=converged"));
+      [](const std::string& text) {
+        return cf::test::containsText(text, "state=applied") ||
+               cf::test::containsText(text, "state=acknowledged");
+      },
+      &output, 400);
+  if (cf::test::containsText(output, "state=acknowledged")) {
+    CF_EXPECT_MSG(cf::test::containsText(output, "evidence recovered by reconciliation"), output);
+  } else {
+    CF_EXPECT_MSG(cf::test::containsText(output, "state=applied"), output);
+    CF_EXPECT(!cf::test::containsText(output, "state=converged"));
+  }
 
   // Restart the controller without the injection: reconciliation must close it.
   CF_EXPECT(controller->kill());
@@ -500,6 +511,40 @@ CF_TEST(injection, truncated_transfer_is_reported_as_a_size_mismatch) {
       },
       &output);
   CF_EXPECT_MSG(blocked, output + controller->logText() + agent->logText());
+  CF_EXPECT(cf::test::readLivePointer(agentState, "fabric/underlay").empty());
+}
+
+CF_TEST(injection, oversized_declaration_is_refused) {
+  Fixture fixture("oversize");
+  const std::string agentState = fixture.directory.child("agent-state");
+  const std::string body = "short payload described as a long one\n";
+  auto agent = cf::test::startAgent(fixture.directory, "rtr-1", agentState);
+  CF_EXPECT(agent != nullptr);
+  if (agent == nullptr) {
+    return;
+  }
+  const std::string plan = cf::test::writePlan(
+      fixture.directory, "set-oversize",
+      {cf::test::TargetSpec{"rtr-1", "fabric/underlay", "cfg/underlay", 1, 1, "atomic-activate",
+                            "require-atomic", agent->endpoint(), "", body, "", 0}},
+      nullptr);
+  auto controller = cf::test::startController(fixture.directory, "ctl-oversize",
+                                              fixture.controllerState, fixture.artifactRoot, {plan},
+                                              "oversize-declare", "2");
+  CF_EXPECT(controller != nullptr);
+  if (controller == nullptr) {
+    return;
+  }
+  std::string output;
+  const bool blocked = cf::test::waitForConvergence(
+      controller->endpoint(), fixture.keyFile,
+      [](const std::string& text) {
+        return cf::test::containsText(text, "size-mismatch-reported");
+      },
+      &output);
+  CF_EXPECT_MSG(blocked, output + controller->logText() + agent->logText());
+  CF_EXPECT(!cf::test::containsText(output, "state=converged"));
+  // A target that was told a size it never received must not activate anything.
   CF_EXPECT(cf::test::readLivePointer(agentState, "fabric/underlay").empty());
 }
 

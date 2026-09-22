@@ -315,7 +315,8 @@ void benchDelivery(std::size_t targetCount, std::size_t artifactBytes, std::size
     }
     planned += created.size();
 
-    // Wait until every delivery of this generation is acknowledged.
+    // Wait until every delivery of this generation has reached a recorded
+    // outcome. Only completed deliveries are counted, never submissions.
     for (;;) {
       auto report = distributor.value()->convergence();
       if (!report) {
@@ -331,14 +332,14 @@ void benchDelivery(std::size_t targetCount, std::size_t artifactBytes, std::size
           acked += 1;
         } else if (lineage.state == cf::DeliveryState::Rejected ||
                    (lineage.state == cf::DeliveryState::Failed && lineage.failures >= 3)) {
-          // Bounded: a failed delivery does not hang the benchmark.
+          // Bounded: a delivery that cannot succeed must not hang the benchmark.
           acked += 1;
         } else {
           done = false;
         }
       }
-      acknowledged = acked;
       if (done) {
+        acknowledged += acked;
         break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -363,8 +364,10 @@ void benchDelivery(std::size_t targetCount, std::size_t artifactBytes, std::size
   result.megabytes =
       (static_cast<double>(acknowledged) * static_cast<double>(artifactBytes)) / (1024.0 * 1024.0);
   report(result);
-  std::printf("                       (planned %zu deliveries across %zu target(s) x %zu generation(s))\n",
-              planned, targetCount, generations);
+  std::printf("                       (%zu deliveries completed of %zu planned, %zu target(s) x %zu "
+              "generation(s), %.1f deliveries/s)\n",
+              acknowledged, planned, targetCount, generations,
+              elapsed > 0 ? static_cast<double>(acknowledged) / elapsed : 0.0);
   std::error_code ec;
   std::filesystem::remove_all(root, ec);
 }

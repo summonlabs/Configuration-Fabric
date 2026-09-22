@@ -966,6 +966,15 @@ Status Distributor::noteEvent(DeliveryRecord& record, EvidenceKind kind,
 
 Status Distributor::recordFailure(DeliveryRecord& record, ErrorCode code, std::string detail,
                                   bool fromTarget) {
+  // The durable event must say what the failure means, not only what it was:
+  // an indeterminate outcome and a fenced operation both require a different
+  // next step from an ordinary retry, and the classification is part of the
+  // error-model contract.
+  if (isIndeterminateCode(code)) {
+    detail.append("; the outcome at the target is unknown, so the next step is reconciliation");
+  } else if (isFencingCode(code)) {
+    detail.append("; the operation was fenced as stale authority, generation or replay");
+  }
   if (detail.size() > kMaxDeliveryDetailBytes) {
     detail.resize(kMaxDeliveryDetailBytes);
   }
@@ -1235,6 +1244,18 @@ Status Distributor::offerAndTransfer(SessionContext& session, DeliveryRecord& re
   }
   prepare.resumeFromOffset = resumeFrom;
 
+  // A lying declaration: the artifact is shorter than the size the controller
+  // claims. The target must refuse to declare the transfer complete rather than
+  // accepting a short payload as if it were whole.
+  const bool oversizeDeclare = options_.faults.armed(fault::kOversizeDeclare);
+  if (oversizeDeclare) {
+    prepare.sizeBytes = record.sizeBytes + (4u * 1024u);
+    Logger::global().warn(kComponent, "fault injection: declaring " +
+                                          std::to_string(prepare.sizeBytes) +
+                                          " bytes for an artifact of " +
+                                          std::to_string(record.sizeBytes) + " bytes");
+  }
+
   auto encoded = encodePrepare(prepare);
   if (!encoded) {
     return Status::fail(encoded.error());
@@ -1424,7 +1445,7 @@ Status Distributor::offerAndTransfer(SessionContext& session, DeliveryRecord& re
   complete.deployment = record.id;
   complete.stream = prepare.stream;
   complete.digest = record.digest;
-  complete.sizeBytes = record.sizeBytes;
+  complete.sizeBytes = prepare.sizeBytes;
   auto completeBytes = encodeTransferComplete(complete);
   if (!completeBytes) {
     return Status::fail(completeBytes.error());
@@ -1948,6 +1969,12 @@ Result<std::vector<ArtifactMetadata>> Distributor::artifacts() const {
 }
 
 Result<std::string> Distributor::statusText() const {
+  // Artifact counts are read before the state lock is taken so that the two
+  // mutexes are never nested: the state lock is the only outer lock in this
+  // class, and keeping it that way is what makes the lock order auditable.
+  const std::size_t artifactCount = artifactStore_->artifactCount();
+  const std::uint64_t artifactBytes = artifactStore_->usedBytes();
+
   std::lock_guard<std::mutex> guard(stateMutex_);
   const ControllerState& state = store_->state();
   std::string out;
@@ -1976,9 +2003,9 @@ Result<std::string> Distributor::statusText() const {
   out.append(std::to_string(state.deliveries.size()));
   out.push_back('\n');
   out.append("artifacts: ");
-  out.append(std::to_string(artifactStore_->artifactCount()));
+  out.append(std::to_string(artifactCount));
   out.append(" (");
-  out.append(std::to_string(artifactStore_->usedBytes()));
+  out.append(std::to_string(artifactBytes));
   out.append(" bytes)\n");
   out.append("durable-journal-bytes: ");
   out.append(std::to_string(store_->journalBytes()));
