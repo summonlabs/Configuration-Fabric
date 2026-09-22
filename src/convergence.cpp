@@ -139,17 +139,14 @@ ConvergenceReport buildConvergenceReport(const ControllerState& state,
       return lhs->id.str() < rhs->id.str();
     });
 
-    // The desired delivery is the newest non-retired record for the lineage.
-    const DeliveryRecord* desired = nullptr;
+    // The desired delivery is the newest record for the lineage. A lineage whose
+    // only record is retired is still reported: omitting it would hide a target
+    // from the summary, and the summary exists to be complete.
+    const DeliveryRecord* desired = records.back();
     for (const DeliveryRecord* record : records) {
       if (record->state == DeliveryState::Retired) {
         report.retiredCount += 1;
-        continue;
       }
-      desired = record;
-    }
-    if (desired == nullptr) {
-      continue;
     }
 
     LineageConvergence lineage;
@@ -232,6 +229,10 @@ ConvergenceReport buildConvergenceReport(const ControllerState& state,
           case ErrorCode::StaleGeneration:
           case ErrorCode::FencedIncarnation:
             lineage.blockers.push_back(BlockerKind::TargetAuthorityFenced);
+            break;
+          case ErrorCode::GenerationConflict:
+          case ErrorCode::Conflict:
+            lineage.blockers.push_back(BlockerKind::PolicyRejected);
             break;
           default:
             break;

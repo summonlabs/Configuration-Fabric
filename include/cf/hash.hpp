@@ -59,6 +59,14 @@ class Sha256 final {
                                       std::span<const std::uint8_t> message) noexcept;
 /// Domain-separated HMAC over a text transcript (see protocol handshake).
 [[nodiscard]] Sha256Digest hmacSha256(const HmacKey& key, std::string_view message) noexcept;
+/// HMAC over a key of any length, per RFC 2104: keys longer than the block size
+/// are hashed first, shorter keys are zero padded. Sessions always use the
+/// fixed-width HmacKey; this general form exists so the primitive can be checked
+/// against the published test vectors.
+[[nodiscard]] Sha256Digest hmacSha256(std::span<const std::uint8_t> key,
+                                      std::span<const std::uint8_t> message) noexcept;
+[[nodiscard]] Sha256Digest hmacSha256(std::span<const std::uint8_t> key,
+                                      std::string_view message) noexcept;
 
 /// Constant-time equality. Authentication decisions must never branch on
 /// secret-derived bytes in a way that leaks timing.

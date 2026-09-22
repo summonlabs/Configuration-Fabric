@@ -115,10 +115,17 @@ class DurableStore final {
       return Result<std::unique_ptr<DurableStore>>::fail(journal.error());
     }
     store->journal_ = std::move(journal).value();
+    const bool created = recovery.journal.outcome == JournalRecovery::Outcome::Created;
 
     auto records = Journal::readFile(journalOptions.path, recovery.journal);
     if (!records) {
       return Result<std::unique_ptr<DurableStore>>::fail(records.error());
+    }
+    if (created) {
+      // Reading the journal back to replay it must not erase the fact that this
+      // open created it; the distinction is what an operator uses to tell a
+      // first start from a recovery.
+      recovery.journal.outcome = JournalRecovery::Outcome::Created;
     }
 
     std::uint64_t baseSequence = 0;

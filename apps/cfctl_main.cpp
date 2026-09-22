@@ -381,6 +381,10 @@ int main(int argc, char** argv) {
       args.authenticate = false;
       continue;
     }
+    if (flag.size() > 2 && flag[0] == '-' && flag[1] == '-') {
+      std::fprintf(stderr, "cfctl: unknown argument '%s'\n", flag.c_str());
+      return 2;
+    }
     args.command.push_back(flag);
   }
 

@@ -57,6 +57,17 @@ struct DistributorPolicy {
   bool reconcileOnRestart{true};
   /// Findings requested in a reconcile report.
   std::size_t maxReconcileFindings{64};
+  /// How often a delivery whose retry budget is exhausted is probed anyway. A
+  /// probe is one session attempt: if the target has restarted, its retry budget
+  /// is re-armed; if not, the next probe waits this long again. Without it a
+  /// target that returns would never be noticed, and with a shorter interval a
+  /// broken target would be hammered.
+  std::int64_t repairProbeMillis{2000};
+  /// Minimum spacing between two session attempts against the same target. A
+  /// scheduler that could dial as fast as it can decide would turn any repeated
+  /// failure into a busy loop; this is the floor that keeps retries honest and
+  /// bounded regardless of how the decision reads.
+  std::int64_t sessionMinIntervalMillis{50};
   /// Wall-clock freshness window applied to persisted target contact evidence
   /// after a restart. Evidence older than this is reported as stale and forces a
   /// fresh session before it can count.

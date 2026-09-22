@@ -31,9 +31,11 @@ namespace cf {
 namespace {
 
 constexpr std::string_view kComponent = "transport";
-/// Cancellation poll interval for accept(). Bounds how long a shutdown can take
-/// without closing a listening handle from another thread.
+/// Cancellation poll intervals. They bound how long a shutdown can take without
+/// closing a handle from another thread: a blocked wait re-checks the
+/// cancellation flag at least this often.
 constexpr std::int64_t kAcceptPollMillis = 50;
+constexpr std::int64_t kSocketPollMillis = 50;
 
 #if defined(_WIN32)
 using NativeSocket = SOCKET;
@@ -137,7 +139,12 @@ constexpr int kShutdownBoth = SHUT_RDWR;
 
 /// Waits for readability or writability. Ok when ready, PeerIdleTimeout when the
 /// deadline elapsed first. A negative deadline blocks indefinitely.
-[[nodiscard]] Status waitFor(NativeSocket handle, bool forRead, std::int64_t deadlineMillis) {
+///
+/// watchError also watches the exception set. A non-blocking connect that is
+/// refused becomes ready through the exception set rather than the write set, so
+/// without it a refused connection would look like a timeout.
+[[nodiscard]] Status waitFor(NativeSocket handle, bool forRead, std::int64_t deadlineMillis,
+                             bool watchError = false) {
   for (;;) {
     const std::int64_t remaining = remainingMillis(deadlineMillis);
     if (deadlineMillis >= 0 && remaining == 0) {
@@ -145,12 +152,17 @@ constexpr int kShutdownBoth = SHUT_RDWR;
     }
     fd_set readSet;
     fd_set writeSet;
+    fd_set errorSet;
     FD_ZERO(&readSet);
     FD_ZERO(&writeSet);
+    FD_ZERO(&errorSet);
     if (forRead) {
       FD_SET(handle, &readSet);
     } else {
       FD_SET(handle, &writeSet);
+      if (watchError) {
+        FD_SET(handle, &errorSet);
+      }
     }
     timeval timeout{};
     timeval* timeoutPtr = nullptr;
@@ -162,10 +174,11 @@ constexpr int kShutdownBoth = SHUT_RDWR;
     }
 #if defined(_WIN32)
     const int ready = ::select(0, forRead ? &readSet : nullptr, forRead ? nullptr : &writeSet,
-                               nullptr, timeoutPtr);
+                               watchError && !forRead ? &errorSet : nullptr, timeoutPtr);
 #else
     const int ready = ::select(static_cast<int>(handle) + 1, forRead ? &readSet : nullptr,
-                               forRead ? nullptr : &writeSet, nullptr, timeoutPtr);
+                               forRead ? nullptr : &writeSet,
+                               watchError && !forRead ? &errorSet : nullptr, timeoutPtr);
 #endif
     if (ready > 0) {
       return Status::ok();
@@ -288,12 +301,14 @@ void Socket::close() noexcept {
 }
 
 void Socket::interrupt() noexcept {
+  interrupted_.store(true, std::memory_order_relaxed);
   if (handle_ == 0) {
     return;
   }
-  // shutdown() is the only socket call that may run concurrently with a blocked
-  // recv()/send() on the same handle. It makes those calls return promptly
-  // without invalidating the handle.
+  // shutdown() is safe to call concurrently with a blocked recv()/send() on the
+  // same handle and unblocks them on POSIX. It is not guaranteed to wake a
+  // select() that is already blocked inside the kernel on every platform, which
+  // is why the read and write paths also poll the cancellation flag.
   ::shutdown(static_cast<NativeSocket>(handle_), kShutdownBoth);
 }
 
@@ -337,7 +352,25 @@ Result<std::size_t> Socket::readSome(std::span<std::uint8_t> out, std::int64_t d
   }
   const NativeSocket handle = static_cast<NativeSocket>(handle_);
   for (;;) {
-    CF_TRY(waitFor(handle, true, deadlineMillis));
+    if (interrupted_.load(std::memory_order_relaxed)) {
+      return Result<std::size_t>::fail(ErrorCode::ConnectionClosed,
+                                       "socket was cancelled locally");
+    }
+    const std::int64_t now = monotonicMillis();
+    std::int64_t slice = now + kSocketPollMillis;
+    if (deadlineMillis >= 0 && deadlineMillis < slice) {
+      slice = deadlineMillis;
+    }
+    const Status ready = waitFor(handle, true, slice);
+    if (!ready) {
+      if (ready.code() == ErrorCode::PeerIdleTimeout) {
+        if (deadlineMillis >= 0 && monotonicMillis() >= deadlineMillis) {
+          return Result<std::size_t>::fail(ready.error());
+        }
+        continue;
+      }
+      return Result<std::size_t>::fail(ready.error());
+    }
 #if defined(_WIN32)
     const int received =
         ::recv(handle, reinterpret_cast<char*>(out.data()), static_cast<int>(out.size()), 0);
@@ -366,7 +399,24 @@ Status Socket::writeAll(std::span<const std::uint8_t> data, std::int64_t deadlin
   const NativeSocket handle = static_cast<NativeSocket>(handle_);
   std::size_t offset = 0;
   while (offset < data.size()) {
-    CF_TRY(waitFor(handle, false, deadlineMillis));
+    if (interrupted_.load(std::memory_order_relaxed)) {
+      return Status::fail(ErrorCode::ConnectionClosed, "socket was cancelled locally");
+    }
+    const std::int64_t now = monotonicMillis();
+    std::int64_t slice = now + kSocketPollMillis;
+    if (deadlineMillis >= 0 && deadlineMillis < slice) {
+      slice = deadlineMillis;
+    }
+    const Status ready = waitFor(handle, false, slice);
+    if (!ready) {
+      if (ready.code() == ErrorCode::PeerIdleTimeout) {
+        if (deadlineMillis >= 0 && monotonicMillis() >= deadlineMillis) {
+          return Status::fail(ready.error());
+        }
+        continue;
+      }
+      return Status::fail(ready.error());
+    }
     const std::size_t remaining = data.size() - offset;
     const std::size_t chunk = std::min<std::size_t>(remaining, 1u << 20);
 #if defined(_WIN32)
@@ -575,7 +625,7 @@ Result<Socket> connectTcp(const std::string& host, std::uint16_t port,
         (void)closeNative(handle);
         continue;
       }
-      const Status wait = waitFor(handle, false, deadline);
+      const Status wait = waitFor(handle, false, deadline, /*watchError=*/true);
       if (!wait) {
         failure = wait;
         (void)closeNative(handle);

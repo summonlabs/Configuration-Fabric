@@ -235,6 +235,42 @@ void Distributor::unregisterConnection(FramedConnection* connection) {
 
 // --- Scheduling ------------------------------------------------------------
 
+bool Distributor::mayDial(const TargetId& target, std::int64_t nowMillis) const {
+  if (claimedTargets_.find(target.str()) != claimedTargets_.end()) {
+    return false;
+  }
+  const auto found = lastSessionAttemptMillis_.find(target.str());
+  if (found == lastSessionAttemptMillis_.end()) {
+    return true;
+  }
+  return (nowMillis - found->second) >= options_.policy.sessionMinIntervalMillis;
+}
+
+const Endpoint* Distributor::endpointOfTarget(const ControllerState& state,
+                                              const TargetId& target) const {
+  static const Endpoint kNone{};
+  const TargetRuntime* runtime = state.findTarget(target);
+  if (runtime == nullptr || runtime->endpoint.empty()) {
+    return &kNone;
+  }
+  static thread_local Endpoint parsed;
+  auto result = parseEndpoint(runtime->endpoint);
+  if (!result || !result.value().isSet()) {
+    return &kNone;
+  }
+  parsed = result.value();
+  return &parsed;
+}
+
+Status Distributor::requestVerification(const TargetId& target) {
+  std::lock_guard<std::mutex> guard(stateMutex_);
+  if (store_->state().findTarget(target) == nullptr) {
+    return Status::fail(ErrorCode::NotFound, "no such target", target.str());
+  }
+  verificationRequests_.insert(target.str());
+  return Status::ok();
+}
+
 bool Distributor::pickWork(TargetId* target, Endpoint* endpoint) {
   std::vector<DeliveryRecord> localWork;
   bool selected = false;
@@ -242,6 +278,23 @@ bool Distributor::pickWork(TargetId* target, Endpoint* endpoint) {
     std::lock_guard<std::mutex> guard(stateMutex_);
     const ControllerState& state = store_->state();
     const std::int64_t now = nowUnixMillis();
+
+    // Operator-requested verification sessions come first: they exist to
+    // re-establish evidence that only a live session can produce.
+    for (auto request = verificationRequests_.begin(); request != verificationRequests_.end();) {
+      auto targetId = parseTargetId(*request);
+      if (!targetId || !mayDial(targetId.value(), now)) {
+        ++request;
+        continue;
+      }
+      claimedTargets_.insert(*request);
+      lastSessionAttemptMillis_[*request] = now;
+      *target = targetId.value();
+      *endpoint = *endpointOfTarget(state, targetId.value());
+      verificationRequests_.erase(request);
+      return true;
+    }
+
     for (const auto& entry : state.deliveries) {
       const DeliveryRecord& record = entry.second;
       if (!isPendingState(record.state)) {
@@ -254,23 +307,13 @@ bool Distributor::pickWork(TargetId* target, Endpoint* endpoint) {
         case PolicyAction::ResumeTransfer:
         case PolicyAction::Activate:
         case PolicyAction::Reconcile: {
-          if (selected) {
-            break;
-          }
-          if (claimedTargets_.find(record.target.str()) != claimedTargets_.end()) {
-            break;
-          }
-          const TargetRuntime* runtime = state.findTarget(record.target);
-          if (runtime == nullptr || runtime->endpoint.empty()) {
-            break;
-          }
-          auto parsed = parseEndpoint(runtime->endpoint);
-          if (!parsed || !parsed.value().isSet()) {
+          if (selected || !mayDial(record.target, now)) {
             break;
           }
           claimedTargets_.insert(record.target.str());
+          lastSessionAttemptMillis_[record.target.str()] = now;
           *target = record.target;
-          *endpoint = parsed.value();
+          *endpoint = *endpointOfTarget(state, record.target);
           selected = true;
           break;
         }
@@ -279,12 +322,28 @@ bool Distributor::pickWork(TargetId* target, Endpoint* endpoint) {
         case PolicyAction::RecordFailureAndRetry:
           localWork.push_back(record);
           break;
+        case PolicyAction::GiveUp: {
+          // The budget is exhausted, but the target may have been repaired or
+          // restarted since. A slow probe costs one session per probe interval
+          // and is what lets a restarted target re-arm its delivery without
+          // operator action.
+          if (selected || input.millisSinceLastAttempt < options_.policy.repairProbeMillis) {
+            break;
+          }
+          if (!mayDial(record.target, now)) {
+            break;
+          }
+          claimedTargets_.insert(record.target.str());
+          lastSessionAttemptMillis_[record.target.str()] = now;
+          *target = record.target;
+          *endpoint = *endpointOfTarget(state, record.target);
+          selected = true;
+          break;
+        }
         case PolicyAction::Wait:
-        case PolicyAction::GiveUp:
         case PolicyAction::None:
-          // Nothing to do: the delivery is either waiting out its backoff or has
-          // exhausted its retry budget, which the convergence report already
-          // surfaces as a blocker. A session would achieve nothing.
+          // Nothing to do: the delivery is waiting out its backoff. A session
+          // would achieve nothing.
           break;
       }
     }
@@ -381,8 +440,11 @@ void Distributor::runSession(const TargetId& target, const Endpoint& endpoint) {
   auto socket = connectTcp(endpoint.host, endpoint.port,
                            options_.policy.connectTimeoutMillis);
   if (!socket) {
-    Logger::global().debug(kComponent, "cannot reach target " + target.str() + " at " +
-                                           endpoint.str() + ": " + socket.error().str());
+    // A target that cannot be reached is a delivery failure like any other: it
+    // must consume the retry budget and be reported, never retried in a hot loop.
+    Logger::global().warn(kComponent, "cannot reach target " + target.str() + " at " +
+                                          endpoint.str() + ": " + socket.error().str());
+    recordSessionFailure(target, socket.error().code(), socket.error().str());
     return;
   }
   auto connection = std::make_shared<FramedConnection>(std::move(socket).value(),
@@ -516,12 +578,14 @@ Status Distributor::handshake(SessionContext& session) {
   // Adopt the target's report as the session's starting point, marked as current
   // because this process established it.
   TargetRuntime runtime;
+  bool observedRestart = false;
   {
     std::lock_guard<std::mutex> guard(stateMutex_);
     const TargetRuntime* existing = store_->state().findTarget(session.target);
     if (existing != nullptr) {
       runtime = *existing;
-      if (runtime.term.isSet() && ack.term > runtime.term) {
+      observedRestart = runtime.term.isSet() && ack.term > runtime.term;
+      if (observedRestart) {
         runtime.restartsObserved += 1;
       }
     }
@@ -539,6 +603,9 @@ Status Distributor::handshake(SessionContext& session) {
   runtime.sessionsEstablished += 1;
   CF_TRY(upsertTarget(runtime));
   markContactCurrent(session.target, true, runtime.lastContactMillis);
+  if (observedRestart) {
+    CF_TRY(rearmAfterRestart(session.target, ack.term));
+  }
   Logger::global().info(kComponent, "session established with " + session.target.str() + " at " +
                                         session.endpoint.str() + " term=" +
                                         std::to_string(ack.term.value()) + " guarantee=" +
@@ -589,6 +656,32 @@ Status Distributor::upsertTarget(const TargetRuntime& runtime) {
     return Status::fail(encoded.error());
   }
   return store_->commit(JournalRecordType::TargetUpsert, encoded.value());
+}
+
+Status Distributor::rearmAfterRestart(const TargetId& target, Term newTerm) {
+  std::vector<DeliveryRecord> failed;
+  {
+    std::lock_guard<std::mutex> guard(stateMutex_);
+    for (const auto& entry : store_->state().deliveries) {
+      if (entry.second.target == target && entry.second.state == DeliveryState::Failed) {
+        failed.push_back(entry.second);
+      }
+    }
+  }
+  for (DeliveryRecord& record : failed) {
+    record.failures = 0;
+    record.attempt = AttemptId::fromValue(record.attempt.value() + 1);
+    const Status noted =
+        noteEvent(record, EvidenceKind::Retried,
+                  "retry budget re-armed: the target came back with boot term " +
+                      std::to_string(newTerm.value()));
+    if (!noted) {
+      return noted;
+    }
+    Logger::global().info(kComponent, "retry budget re-armed for " + record.id.str() +
+                                          " after target " + target.str() + " restarted");
+  }
+  return Status::ok();
 }
 
 void Distributor::markContactCurrent(const TargetId& target, bool current, std::int64_t atMillis) {
@@ -680,10 +773,14 @@ Status Distributor::reconcile(SessionContext& session) {
   runtime.preparedDigest = session.report.preparedDigest;
   runtime.lastContactMillis = nowUnixMillis();
   runtime.contactEstablishedThisProcess = false;
-  runtime.restartsObserved = std::max<std::uint64_t>(runtime.restartsObserved,
-                                                     session.report.restartCount);
+  // restartsObserved counts restarts this controller has witnessed. The target's
+  // own start counter is a different number and is reported by the target, so the
+  // two are never merged into one field.
   CF_TRY(upsertTarget(runtime));
   markContactCurrent(session.target, true, runtime.lastContactMillis);
+  Logger::global().debug(kComponent, "target " + session.target.str() +
+                                         " reports restart count " +
+                                         std::to_string(session.report.restartCount));
   return applyReconcileReport(session);
 }
 
@@ -1005,6 +1102,11 @@ Status Distributor::driveDeliveries(SessionContext& session) {
     }
     const Status driven = driveDelivery(session, queued);
     if (!driven) {
+      // A delivery that cannot progress must say so: silence here would look
+      // exactly like a healthy session.
+      Logger::global().warn(kComponent, "delivery " + queued.id.str() +
+                                            " could not progress in this session: " +
+                                            driven.str());
       if (driven.code() == ErrorCode::ConnectionClosed ||
           driven.code() == ErrorCode::ConnectionReset ||
           driven.code() == ErrorCode::TruncatedFrame ||
@@ -1073,9 +1175,22 @@ Status Distributor::driveDelivery(SessionContext& session, const DeliveryRecord&
                              decision.reason, false));
         return Status::ok();
       case PolicyAction::Offer:
-      case PolicyAction::ResumeTransfer:
+      case PolicyAction::ResumeTransfer: {
+        // A retry re-enters the pipeline at its first boundary. The lifecycle has
+        // exactly one edge for that (failed -> prepared); taking it keeps every
+        // later transition forward and legal instead of silently stretching the
+        // table.
+        if (record.state == DeliveryState::Failed) {
+          CF_TRY(recordTransition(record, DeliveryState::Prepared, EvidenceKind::Retried,
+                                  ErrorCode::Ok,
+                                  "retry attempt " +
+                                      std::to_string(record.attempt.value() + 1) +
+                                      " begins; the delivery re-enters at the offer boundary",
+                                  false));
+        }
         CF_TRY(offerAndTransfer(session, record));
         break;
+      }
       case PolicyAction::Activate:
         CF_TRY(activateDelivery(session, record));
         break;
@@ -1190,6 +1305,8 @@ Status Distributor::offerAndTransfer(SessionContext& session, DeliveryRecord& re
   }
   std::uint64_t offset = resumeFrom;
   if (offset != 0) {
+    Logger::global().info(kComponent, "resuming the transfer for " + record.id.str() +
+                                          " at byte " + std::to_string(offset));
     CF_TRY(noteEvent(record, EvidenceKind::BytesAccepted,
                      "resuming the transfer at byte " + std::to_string(offset)));
   }

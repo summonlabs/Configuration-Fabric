@@ -62,6 +62,10 @@ Status DistributorPolicy::validate() const {
   if (maxHistoryPerLineage == 0) {
     return Status::fail(ErrorCode::InvalidArgument, "maxHistoryPerLineage must be at least 1");
   }
+  if (repairProbeMillis <= 0 || sessionMinIntervalMillis <= 0) {
+    return Status::fail(ErrorCode::InvalidArgument,
+                        "probe and session interval bounds must be positive");
+  }
   return Status::ok();
 }
 
@@ -89,6 +93,8 @@ std::string DistributorPolicy::render() const {
   line("transfer-chunk-bytes", transferChunkBytes);
   line("max-payload-bytes", maxPayloadBytes);
   line("liveness-freshness-ms", livenessFreshnessMillis);
+  line("repair-probe-ms", repairProbeMillis);
+  line("session-min-interval-ms", sessionMinIntervalMillis);
   out.append("  require-acknowledgement = ");
   out.append(requireAcknowledgement ? "true" : "false");
   out.push_back('\n');
@@ -266,9 +272,18 @@ Decision decide(const DistributorPolicy& policy, const DecisionInput& input, Epo
   }
 
   if (!input.targetLive) {
-    rejectAlternative(PolicyAction::Offer, "no live session exists for the target");
-    decision.action = PolicyAction::Wait;
-    decision.reason = "target has no live session; the next connection attempt will drive delivery";
+    // Evidence that is absent, aged out, or was invalidated by a failed session
+    // cannot justify any state change - but doing nothing would leave the target
+    // unreachable forever. The action is therefore to re-establish evidence with
+    // a session; the scheduler rate-limits how often that may be attempted, and
+    // the retry budget bounds how many times it may fail.
+    rejectAlternative(PolicyAction::Offer, "no fresh session evidence exists for the target");
+    decision.action = PolicyAction::Reconcile;
+    decision.reason = input.livenessEvidenceStale
+                          ? "persisted contact evidence predates this process; a live session "
+                            "must re-establish it"
+                          : "target contact evidence is older than the freshness window; a live "
+                            "session must refresh it";
     return decision;
   }
 

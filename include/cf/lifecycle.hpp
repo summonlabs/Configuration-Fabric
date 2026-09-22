@@ -120,6 +120,8 @@ struct LifecycleEvent {
   std::int64_t atMillis{0};
   std::string detail;
 
+  friend bool operator==(const LifecycleEvent&, const LifecycleEvent&) noexcept = default;
+
   [[nodiscard]] std::string render() const;
 };
 

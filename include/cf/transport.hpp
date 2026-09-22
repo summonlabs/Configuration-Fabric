@@ -73,6 +73,10 @@ class Socket final {
   [[nodiscard]] Endpoint peer() const;
 
   [[nodiscard]] std::uintptr_t handle() const noexcept { return handle_; }
+  /// True once interrupt() has been called.
+  [[nodiscard]] bool interrupted() const noexcept {
+    return interrupted_.load(std::memory_order_relaxed);
+  }
 
  private:
   friend class Listener;
@@ -81,6 +85,10 @@ class Socket final {
   explicit Socket(std::uintptr_t handle) noexcept : handle_(handle) {}
 
   std::uintptr_t handle_{0};
+  /// Set by interrupt(). A blocked read or write observes it within one poll
+  /// slice, which is what makes cancellation prompt on platforms where a
+  /// shutdown() does not wake a select() that is already blocked in the kernel.
+  std::atomic<bool> interrupted_{false};
 };
 
 class Listener final {

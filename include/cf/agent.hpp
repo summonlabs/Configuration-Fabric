@@ -63,6 +63,9 @@ inline constexpr std::string_view kAfterVerify = "after-verify";
 inline constexpr std::string_view kAfterStage = "after-stage";
 inline constexpr std::string_view kAfterPrepare = "after-prepare";
 inline constexpr std::string_view kBeforeCommit = "before-commit";
+/// Between the atomic activation switch and the durable record of it: the
+/// narrowest window in which the live pointer and durable state disagree.
+inline constexpr std::string_view kAfterSwitch = "after-switch";
 inline constexpr std::string_view kAfterCommit = "after-commit";
 inline constexpr std::string_view kWithholdAck = "withhold-ack";
 inline constexpr std::string_view kCorruptChunk = "corrupt-chunk";

@@ -303,6 +303,11 @@ Result<std::unique_ptr<Journal>> Journal::open(const Options& options, JournalRe
                                                                    : ErrorCode::IoFailure,
                                                   "journal recovery failed", recovery.render());
   }
+  // The scan above is the authority for where the log resumes: without this the
+  // next append would be numbered from zero and the journal would fail its own
+  // sequence check on the following open.
+  journal->lastSequence_ = recovery.lastSequence;
+  journal->recordCount_ = recovery.recordsRecovered;
   journal->file_ = std::fopen(options.path.c_str(), "r+b");
   if (journal->file_ == nullptr) {
     return Result<std::unique_ptr<Journal>>::fail(ErrorCode::OpenFailed, "cannot open journal",

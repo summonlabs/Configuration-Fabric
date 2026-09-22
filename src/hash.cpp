@@ -154,21 +154,29 @@ void Sha256::update(std::string_view data) noexcept {
 
 Sha256Digest Sha256::finish() noexcept {
   const std::uint64_t bitLength = totalBytes_ * 8u;
-  // The tail holds 0x80, the zero padding, and the 64-bit big-endian bit count.
-  // Worst case (buffered_ == 56) needs 72 bytes, but compress() always consumes
-  // whole 64-byte blocks, so the buffer must cover the final rounded-up block.
-  std::array<std::uint8_t, 128> tail{};
-  tail[0] = 0x80u;
-  const std::size_t afterMarker = (buffered_ + 1) % 64;
-  const std::size_t padZeros = (afterMarker <= 56) ? (56 - afterMarker) : (120 - afterMarker);
-  const std::size_t lengthOffset = 1 + padZeros;
-  const std::size_t tailLength = lengthOffset + 8;
-  for (std::size_t i = 0; i < 8; ++i) {
-    tail[lengthOffset + i] = static_cast<std::uint8_t>((bitLength >> (56 - (i * 8))) & 0xFFu);
+  // The final blocks are: the bytes still held in the buffer, the 0x80 marker,
+  // zero padding to 56 modulo 64, and the 64-bit big-endian bit count. Held
+  // bytes are part of the message and must be compressed here; a finalization
+  // that ignored them would make the digest depend on the message length alone,
+  // which would let a same-length corruption pass verification.
+  std::array<std::uint8_t, 128> final{};
+  const std::size_t held = buffered_;
+  for (std::size_t i = 0; i < held; ++i) {
+    final[i] = buffer_[i];
   }
-  CF_CONTRACT((buffered_ + tailLength) % 64 == 0, "sha256 padding must be block aligned");
-  for (std::size_t offset = 0; offset < tailLength; offset += 64) {
-    compress(tail.data() + offset);
+  final[held] = 0x80u;
+  const std::size_t afterMarker = (held + 1) % 64;
+  const std::size_t padZeros = (afterMarker <= 56) ? (56 - afterMarker) : (120 - afterMarker);
+  const std::size_t lengthOffset = held + 1 + padZeros;
+  const std::size_t totalLength = lengthOffset + 8;
+  CF_CONTRACT(totalLength <= final.size(), "sha256 final buffer is large enough");
+  CF_CONTRACT(totalLength % 64 == 0, "sha256 padding must be block aligned");
+  for (std::size_t i = 0; i < 8; ++i) {
+    final[lengthOffset + i] = static_cast<std::uint8_t>((bitLength >> (56 - (i * 8))) & 0xFFu);
+  }
+  buffered_ = 0;
+  for (std::size_t offset = 0; offset < totalLength; offset += 64) {
+    compress(final.data() + offset);
   }
 
   Sha256Digest digest{};
@@ -181,14 +189,26 @@ Sha256Digest Sha256::finish() noexcept {
   return digest;
 }
 
-Sha256Digest hmacSha256(const HmacKey& key, std::span<const std::uint8_t> message) noexcept {
+Sha256Digest hmacSha256(std::span<const std::uint8_t> key,
+                               std::span<const std::uint8_t> message) noexcept {
   constexpr std::size_t kBlock = 64;
+  std::array<std::uint8_t, kBlock> normalised{};
+  if (key.size() > kBlock) {
+    const Sha256Digest hashed = sha256(key);
+    for (std::size_t i = 0; i < hashed.size(); ++i) {
+      normalised[i] = hashed[i];
+    }
+  } else {
+    for (std::size_t i = 0; i < key.size(); ++i) {
+      normalised[i] = key[i];
+    }
+  }
+
   std::array<std::uint8_t, kBlock> inner{};
   std::array<std::uint8_t, kBlock> outer{};
   for (std::size_t i = 0; i < kBlock; ++i) {
-    const std::uint8_t byte = (i < key.size()) ? key[i] : 0u;
-    inner[i] = static_cast<std::uint8_t>(byte ^ 0x36u);
-    outer[i] = static_cast<std::uint8_t>(byte ^ 0x5cu);
+    inner[i] = static_cast<std::uint8_t>(normalised[i] ^ 0x36u);
+    outer[i] = static_cast<std::uint8_t>(normalised[i] ^ 0x5cu);
   }
 
   Sha256 hasher;
@@ -202,7 +222,17 @@ Sha256Digest hmacSha256(const HmacKey& key, std::span<const std::uint8_t> messag
   return outerHasher.finish();
 }
 
+Sha256Digest hmacSha256(const HmacKey& key, std::span<const std::uint8_t> message) noexcept {
+  return hmacSha256(std::span<const std::uint8_t>(key.data(), key.size()), message);
+}
+
 Sha256Digest hmacSha256(const HmacKey& key, std::string_view message) noexcept {
+  return hmacSha256(std::span<const std::uint8_t>(key.data(), key.size()),
+                    std::span<const std::uint8_t>(
+                        reinterpret_cast<const std::uint8_t*>(message.data()), message.size()));
+}
+
+Sha256Digest hmacSha256(std::span<const std::uint8_t> key, std::string_view message) noexcept {
   return hmacSha256(key, std::span<const std::uint8_t>(
                              reinterpret_cast<const std::uint8_t*>(message.data()), message.size()));
 }

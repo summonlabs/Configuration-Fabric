@@ -28,8 +28,13 @@ constexpr std::string_view kComponent = "artifact-store";
   return digest.hex().substr(0, 2);
 }
 
+/// True for every name a partial publish can leave behind. The staging files are
+/// written as ".staging-<random>.part" and metadata temporaries as
+/// "<path>.part-<random>", so both markers are checked.
 [[nodiscard]] bool isPartialFileName(const std::string& name) {
-  return name.find(".part-") != std::string::npos;
+  return name.find(".part-") != std::string::npos ||
+         name.rfind(".staging-", 0) == 0 ||
+         (name.size() > 5 && name.compare(name.size() - 5, 5, ".part") == 0);
 }
 
 }  // namespace
@@ -547,30 +552,47 @@ void ArtifactStore::quarantine(const Digest& digest) {
 }
 
 Status ArtifactStore::verify(const Digest& digest) {
-  auto opened = ArtifactReader::open(*this, digest);
-  if (!opened) {
-    return opened.error();
-  }
-  ArtifactReader& reader = *opened.value();
-  std::uint64_t offset = 0;
-  while (offset < reader.size()) {
-    auto chunk = reader.readAt(offset, options_.readChunkBytes);
-    if (!chunk) {
-      return chunk.error();
+  Status outcome = Status::ok();
+  bool corrupt = false;
+  {
+    // The reader owns an open handle, so it must go out of scope before the
+    // artifact can be quarantined: renaming an open file fails on Windows.
+    auto opened = ArtifactReader::open(*this, digest);
+    if (!opened) {
+      return opened.error();
     }
-    if (chunk.value().empty()) {
-      return Status::fail(ErrorCode::IntegrityFailure,
-                          "artifact payload ended before its declared size");
+    ArtifactReader& reader = *opened.value();
+    std::uint64_t offset = 0;
+    while (offset < reader.size()) {
+      auto chunk = reader.readAt(offset, options_.readChunkBytes);
+      if (!chunk) {
+        // The reader verifies the digest as it consumes the last byte, so a
+        // mismatch arrives here rather than through verified().
+        corrupt = isIntegrityCode(chunk.error().code());
+        outcome = Status::fail(chunk.error());
+        break;
+      }
+      if (chunk.value().empty()) {
+        corrupt = true;
+        outcome = Status::fail(ErrorCode::IntegrityFailure,
+                               "artifact payload ended before its declared size");
+        break;
+      }
+      offset += chunk.value().size();
     }
-    offset += chunk.value().size();
+    if (outcome && !reader.verified()) {
+      corrupt = true;
+      outcome = Status::fail(ErrorCode::DigestMismatch,
+                             "artifact content no longer matches its recorded digest",
+                             shortDigest(digest));
+    }
   }
-  if (!reader.verified()) {
-    quarantine(digest);
-    return Status::fail(ErrorCode::DigestMismatch,
-                        "artifact content no longer matches its recorded digest",
-                        shortDigest(digest));
+  if (!corrupt) {
+    return Status::ok();
   }
-  return Status::ok();
+  // The artifact leaves the index and can never be served again.
+  quarantine(digest);
+  return outcome;
 }
 
 std::vector<std::pair<Digest, Status>> ArtifactStore::verifyAll() {

@@ -350,6 +350,21 @@ int main(int argc, char** argv) {
   if (!liveRecovery.detail.empty()) {
     cf::Logger::global().warn("agent", "start-up reconciliation: " + liveRecovery.detail);
   }
+  if (liveRecovery.rolledBackUnresolvedPrepare) {
+    cf::Logger::global().warn("agent",
+                              "an unresolved prepare window was aborted: the target is on its "
+                              "previous generation and the delivery must be re-driven");
+  }
+  if (liveRecovery.adoptedCompletedSwitch) {
+    cf::Logger::global().info("agent",
+                              "the live pointer recorded a completed activation; durable state "
+                              "was reconciled to it (adopted-live-pointer)");
+  }
+  if (liveRecovery.clearedUnverifiableCommit) {
+    cf::Logger::global().warn("agent",
+                              "committed state could not be verified against the live area and "
+                              "was cleared; the target reports no active generation");
+  }
   cf::Logger::global().info("agent", "durable state: " + recovery.render());
   if (!options.faults.empty()) {
     cf::Logger::global().warn("agent", "fault injection armed: " + options.faults.render());

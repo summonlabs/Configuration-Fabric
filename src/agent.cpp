@@ -186,12 +186,14 @@ Result<fault::FaultPlan> fault::FaultPlan::parse(std::string_view text) {
   if (text.empty()) {
     return Result<FaultPlan>::ok(std::move(plan));
   }
-  const std::array<std::string_view, 14> known = {
+  // Every documented injection point. A typo in an operator's fault plan is an
+  // error rather than a silently disabled scenario.
+  const std::array<std::string_view, 15> known = {
       fault::kAfterOffer,       fault::kAfterChunk,       fault::kAfterVerify,
       fault::kAfterStage,       fault::kAfterPrepare,     fault::kBeforeCommit,
-      fault::kAfterCommit,      fault::kWithholdAck,      fault::kCorruptChunk,
-      fault::kTruncateTransfer, fault::kDropAfterPrepare, fault::kStaleCommit,
-      fault::kDuplicateChunk,   fault::kOversizeDeclare};
+      fault::kAfterSwitch,      fault::kAfterCommit,      fault::kWithholdAck,
+      fault::kCorruptChunk,     fault::kTruncateTransfer, fault::kDropAfterPrepare,
+      fault::kStaleCommit,      fault::kDuplicateChunk,   fault::kOversizeDeclare};
 
   std::size_t start = 0;
   while (start <= text.size()) {
@@ -473,7 +475,13 @@ Status TargetAgent::recoverLiveArea(LiveRecovery& recovery) {
 
   // 2. The live pointer is the authority for what is activated. Durable state is
   //    reconciled to it, in either direction, and the resolution is recorded.
-  for (const auto& entry : std::filesystem::directory_iterator(liveRoot_, ec)) {
+  //
+  //    A config key may contain separators, so the live area is a tree and the
+  //    walk must be recursive: only directories that actually hold a pointer or
+  //    a prepare marker are key directories. Inspecting one level would mistake
+  //    the first path component for a key and report a missing pointer for a
+  //    target that is in fact activated.
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(liveRoot_, ec)) {
     if (ec) {
       break;
     }
@@ -483,6 +491,15 @@ Status TargetAgent::recoverLiveArea(LiveRecovery& recovery) {
     const std::string directory = entry.path().string();
     const std::string currentPath = directory + "/current";
     const std::string pendingPath = directory + "/pending";
+    std::error_code probeError;
+    if (!std::filesystem::exists(currentPath, probeError) &&
+        !std::filesystem::exists(pendingPath, probeError)) {
+      continue;
+    }
+    // A directory that holds payloads but no marker is not a key directory.
+    if (entry.path().filename() == "payload") {
+      continue;
+    }
 
     const bool pendingPresent = std::filesystem::exists(pendingPath, ec);
     auto pointer = readLiveValue(currentPath);
@@ -514,14 +531,22 @@ Status TargetAgent::recoverLiveArea(LiveRecovery& recovery) {
           liveDigest == state.preparedDigest) {
         // The switch completed; only the resolve record is missing.
         recovery.adoptedCompletedSwitch = true;
+        recovery.detail.append("adopted-completed-switch=");
       } else {
         recovery.rolledBackUnresolvedPrepare = true;
         state.applyRollbacks += 1;
+        recovery.detail.append("aborted-unresolved-prepare=");
         CF_TRY(store_->commit(JournalRecordType::AgentRollbackNote, rollbackPayload(state)));
       }
       std::error_code removed;
       std::filesystem::remove(pendingPath, removed);
-      recovery.detail.append("resolved-prepare-window=");
+      // The durable prepare marker is resolved here, exactly once, so the
+      // later check cannot count the same window a second time.
+      if (state.applyPrepared) {
+        ByteWriter resolved(32);
+        resolved.u64(state.activations);
+        CF_TRY(store_->commit(JournalRecordType::AgentApplyResolved, resolved.span()));
+      }
       recovery.detail.append(directory);
       recovery.detail.push_back(' ');
     }
@@ -1013,6 +1038,11 @@ Status TargetAgent::onPrepare(Session& session, std::span<const std::uint8_t> pa
   if (state.committedGeneration.isSet() && message.generation < state.committedGeneration) {
     state.staleOffersRefused += 1;
     CF_TRY(store_->commit(JournalRecordType::AgentRollbackNote, rollbackPayload(state)));
+    Logger::global().warn(kComponent, "refused a stale offer for " + message.key.str() +
+                                          ": generation " +
+                                          std::to_string(message.generation.value()) +
+                                          " is older than the committed generation " +
+                                          std::to_string(state.committedGeneration.value()));
     return refusePrepare(session, message, ErrorCode::StaleGeneration,
                          "offered generation is older than the committed generation",
                          DeliveryState::Applied);
@@ -1058,6 +1088,10 @@ Status TargetAgent::onPrepare(Session& session, std::span<const std::uint8_t> pa
     ack.priorDigest = finding->digest;
     ack.resumeFromOffset = message.sizeBytes;
     state.duplicatesSuppressed += 1;
+    Logger::global().info(kComponent, "suppressed a duplicate delivery for " + message.key.str() +
+                                          " generation " +
+                                          std::to_string(message.generation.value()) +
+                                          ": this content is already recorded as active");
     CF_TRY(store_->commit(JournalRecordType::AgentRollbackNote, rollbackPayload(state)));
     CF_TRY_ASSIGN(const std::vector<std::uint8_t> encoded, encodePrepareAck(ack));
     CF_TRY(session.connection->send(FrameType::PrepareAck, kFrameFlagResponse, encoded,
@@ -1069,8 +1103,23 @@ Status TargetAgent::onPrepare(Session& session, std::span<const std::uint8_t> pa
   const auto existing = state.transfers.find(message.deployment);
   if (existing != state.transfers.end()) {
     const TransferRecord& record = existing->second;
-    if (record.digest == message.digest && record.generation == message.generation &&
-        record.totalBytes == message.sizeBytes && !record.verified) {
+    const bool sameContent = record.digest == message.digest &&
+                             record.generation == message.generation &&
+                             record.totalBytes == message.sizeBytes;
+    if (sameContent && record.verified) {
+      // The artifact was already received and verified. Discarding it would throw
+      // away completed work and force a full re-transfer, so the resume point is
+      // simply the whole artifact.
+      std::error_code sizeError;
+      const std::uintmax_t onDisk =
+          std::filesystem::file_size(stagingPath(message.deployment), sizeError);
+      if (!sizeError && static_cast<std::uint64_t>(onDisk) == record.totalBytes) {
+        resumeFrom = record.totalBytes;
+      } else {
+        CF_TRY(destroyTransfer(message.deployment,
+                               "verified bytes are no longer present on disk"));
+      }
+    } else if (sameContent && !record.verified) {
       std::error_code sizeError;
       const std::uintmax_t onDisk =
           std::filesystem::file_size(stagingPath(message.deployment), sizeError);
@@ -1083,6 +1132,12 @@ Status TargetAgent::onPrepare(Session& session, std::span<const std::uint8_t> pa
     }
   }
 
+  if (resumeFrom > 0) {
+    Logger::global().info(kComponent, "resuming the transfer for " + message.key.str() +
+                                          " generation " +
+                                          std::to_string(message.generation.value()) +
+                                          " at byte " + std::to_string(resumeFrom));
+  }
   CF_TRY(beginTransfer(message, resumeFrom, nullptr));
   ack.resumeFromOffset = resumeFrom;
   CF_TRY_ASSIGN(const std::vector<std::uint8_t> encoded, encodePrepareAck(ack));
@@ -1431,6 +1486,10 @@ Status TargetAgent::onApplyCommit(Session& session, std::span<const std::uint8_t
   if (state.committedGeneration.isSet() && message.generation < state.committedGeneration) {
     state.staleOffersRefused += 1;
     CF_TRY(store_->commit(JournalRecordType::AgentRollbackNote, rollbackPayload(state)));
+    Logger::global().warn(kComponent, "refused a stale commit: generation " +
+                                          std::to_string(message.generation.value()) +
+                                          " is older than the committed generation " +
+                                          std::to_string(state.committedGeneration.value()));
     ack.committed = false;
     ack.code = ErrorCode::StaleGeneration;
     ack.detail = "commit refused: the generation is older than the committed one";
@@ -1444,6 +1503,10 @@ Status TargetAgent::onApplyCommit(Session& session, std::span<const std::uint8_t
     // is re-applied.
     state.duplicatesSuppressed += 1;
     CF_TRY(store_->commit(JournalRecordType::AgentRollbackNote, rollbackPayload(state)));
+    Logger::global().info(kComponent,
+                          "suppressed a duplicate activation: generation " +
+                              std::to_string(message.generation.value()) +
+                              " is already active, so the commit was not re-applied");
     ack.committed = true;
     ack.state = DeliveryState::Applied;
     ack.code = ErrorCode::DuplicateSuppressed;
@@ -1454,6 +1517,10 @@ Status TargetAgent::onApplyCommit(Session& session, std::span<const std::uint8_t
   }
   if (state.committedGeneration.isSet() && message.generation == state.committedGeneration &&
       !(message.digest == state.committedDigest)) {
+    Logger::global().warn(kComponent,
+                          "refused a commit for generation " +
+                              std::to_string(message.generation.value()) +
+                              ": a different digest is already committed for that generation");
     ack.committed = false;
     ack.code = ErrorCode::GenerationConflict;
     ack.detail = "a different digest is already committed for this generation";
@@ -1501,6 +1568,26 @@ Status TargetAgent::onApplyCommit(Session& session, std::span<const std::uint8_t
     CF_TRY(respond());
     return sendNack(session, message.deployment, current.key, message.generation, message.digest,
                     ErrorCode::Conflict, "commit content conflict");
+  }
+  // A target that cannot activate atomically must be driven through its explicit
+  // prepare window. Accepting a bare commit would silently promote the weaker
+  // contract to an atomic-looking one, which is exactly the claim this runtime
+  // refuses to make.
+  if (state.guarantee == ApplyGuarantee::PrepareCommitAbort && !state.applyPrepared) {
+    ack.committed = false;
+    ack.code = ErrorCode::NotPrepared;
+    ack.detail = "this target requires an explicit prepare window before a commit";
+    CF_TRY(respond());
+    return sendNack(session, message.deployment, current.key, message.generation, message.digest,
+                    ErrorCode::NotPrepared, ack.detail);
+  }
+  if (state.applyPrepared && !(state.preparedDeployment == message.deployment)) {
+    ack.committed = false;
+    ack.code = ErrorCode::Conflict;
+    ack.detail = "a different deployment holds the open prepare window";
+    CF_TRY(respond());
+    return sendNack(session, message.deployment, current.key, message.generation, message.digest,
+                    ErrorCode::Conflict, ack.detail);
   }
 
   const Status activated = activate(current, state.guarantee == ApplyGuarantee::PrepareCommitAbort);
@@ -1573,6 +1660,13 @@ Status TargetAgent::activate(const TransferRecord& transfer, bool explicitPrepar
   if (explicitPrepare) {
     std::error_code removed;
     std::filesystem::remove(pendingPath, removed);
+  }
+
+  if (options_.faults.armed(fault::kAfterSwitch)) {
+    Logger::global().warn(kComponent,
+                          "fault injection: dying after the activation switch, before the "
+                          "durable record of it");
+    crashNow(78);
   }
 
   CF_TRY(commitGeneration(transfer.deployment, transfer.key, transfer.generation, transfer.digest,

@@ -115,6 +115,7 @@ std::string renderControlCommands() {
       "  explain <target>             full explanation for one target\n"
       "  artifacts                    artifact inventory\n"
       "  verify-artifacts             recompute every stored artifact digest\n"
+      "  verify <target>              open one verification session against a target\n"
       "  plan <path>                  load and submit a deployment plan file\n"
       "  retire <deployment-id> [why] retire a delivery\n"
       "  lifecycle                    the delivery transition relation\n"
@@ -364,6 +365,21 @@ Result<std::string> executeControlCommand(Distributor& distributor,
       return Result<std::string>::fail(retired.error());
     }
     return Result<std::string>::ok("retired " + id.value().str() + "\n");
+  }
+  if (command == "verify") {
+    if (request.arguments.empty()) {
+      return Result<std::string>::fail(ErrorCode::MissingField, "verify needs a target id");
+    }
+    auto target = parseTargetId(request.arguments[0]);
+    if (!target) {
+      return Result<std::string>::fail(target.error());
+    }
+    const Status requested = distributor.requestVerification(target.value());
+    if (!requested) {
+      return Result<std::string>::fail(requested.error());
+    }
+    return Result<std::string>::ok("verification session requested for " + target.value().str() +
+                                   "\n");
   }
   if (command == "lifecycle") {
     return Result<std::string>::ok(renderTransitionTable());

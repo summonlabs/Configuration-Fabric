@@ -110,6 +110,11 @@ class Distributor final {
   void setShutdownFlag(std::atomic<bool>* flag) noexcept { externalShutdown_ = flag; }
   /// Requests a clean shutdown from the control channel. Idempotent.
   void requestShutdown() noexcept { shutdownRequested_.store(true, std::memory_order_relaxed); }
+  /// Asks the scheduler to open one verification session against a target, even
+  /// if it has no pending delivery. That session re-establishes contact evidence
+  /// and reconciles authoritative state, which is how an operator re-validates a
+  /// converged claim after a target restart without waiting for new work.
+  [[nodiscard]] Status requestVerification(const TargetId& target);
   /// Recomputes every stored artifact digest. Reports one result per artifact.
   [[nodiscard]] Result<std::vector<std::pair<Digest, Status>>> verifyArtifacts() const;
 
@@ -149,6 +154,14 @@ class Distributor final {
   void workerLoop(std::size_t workerIndex);
   void controlLoop();
   [[nodiscard]] bool pickWork(TargetId* target, Endpoint* endpoint);
+  /// Rate limit: a target may not be dialled more often than the configured
+  /// session interval, and never while another worker holds it. Callers must
+  /// hold stateMutex_.
+  [[nodiscard]] bool mayDial(const TargetId& target, std::int64_t nowMillis) const;
+  /// Resolves a target's dialable endpoint, or an unset endpoint when it has
+  /// none. Callers must hold stateMutex_.
+  [[nodiscard]] const Endpoint* endpointOfTarget(const ControllerState& state,
+                                                 const TargetId& target) const;
   /// Applies a policy decision that needs no target session (reject, retire or
   /// account a failure). Called with no lock held.
   void applyLocalDecision(const DeliveryRecord& candidate);
@@ -189,6 +202,11 @@ class Distributor final {
   /// across a restart, so it is recorded in memory only, while the durable
   /// timestamp is written by upsertTarget.
   void markContactCurrent(const TargetId& target, bool current, std::int64_t atMillis);
+  /// Re-arms the retry budget of a target's failed deliveries after the target
+  /// comes back with a new boot term. A restarted process is not the process the
+  /// failures were recorded against, so the budget is restored exactly once per
+  /// observed restart and the reason is recorded as evidence.
+  [[nodiscard]] Status rearmAfterRestart(const TargetId& target, Term newTerm);
   [[nodiscard]] Status applyReconcileReport(const SessionContext& session);
   void registerConnection(const std::shared_ptr<FramedConnection>& connection);
   void unregisterConnection(FramedConnection* connection);
@@ -203,6 +221,13 @@ class Distributor final {
 
   mutable std::mutex stateMutex_;
   std::set<std::string> claimedTargets_;
+  /// Process-local record of when each target was last dialled, used only to
+  /// rate-limit session attempts. Never persisted: it is scheduling state, not
+  /// delivery evidence.
+  std::map<std::string, std::int64_t> lastSessionAttemptMillis_;
+  /// Targets an operator asked to re-verify. Process-local by design: a request
+  /// is a scheduling instruction, not delivery evidence.
+  std::set<std::string> verificationRequests_;
 
   std::mutex connectionsMutex_;
   std::vector<std::weak_ptr<FramedConnection>> connections_;
