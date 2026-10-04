@@ -1,6 +1,6 @@
 # Configuration Fabric
 
-**A vendor-neutral Fabric OS runtime for distributing already-produced network
+**A vendor-neutral runtime for distributing already-produced network
 configuration and proving what each target actually activated.**
 
 Configuration Fabric is a standalone C++20 runtime, built by
