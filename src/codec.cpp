@@ -4,9 +4,12 @@
 
 #include "cf/codec.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <system_error>
+#include <thread>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -245,7 +248,29 @@ Status writeFileAtomic(const std::string& path, std::span<const std::uint8_t> co
   std::fclose(file);
 
   std::error_code ec;
-  std::filesystem::rename(temporary, path, ec);
+  // While a reader has the target open (an inspection, an antivirus or
+  // indexing scan) the replacing rename fails on Windows until the reader
+  // closes the file, so it is retried for a bounded time (about 2 s) before the
+  // fallback below. A directory in the way is not transient.
+  for (int attempt = 0;; ++attempt) {
+    std::filesystem::rename(temporary, path, ec);
+    if (!ec) {
+      break;
+    }
+#if defined(_WIN32)
+    // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
+    std::error_code kind;
+    const bool transient = ec.category() == std::system_category() &&
+                           (ec.value() == 5 || ec.value() == 32 || ec.value() == 33) &&
+                           !std::filesystem::is_directory(path, kind);
+#else
+    const bool transient = false;
+#endif
+    if (!transient || attempt >= 100) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
   if (ec) {
     // Rename over an existing file is not universally permitted; fall back to a
     // remove-then-rename, which is still crash-safe because the temporary file

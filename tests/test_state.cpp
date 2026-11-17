@@ -2,13 +2,18 @@
 // Copyright 2026 Summon Software Labs.
 // SPDX-License-Identifier: Apache-2.0
 
+#include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "cf/codec.hpp"
 #include "cf/rng.hpp"
 #include "cf/state.hpp"
 #include "cf/store.hpp"
+#include "cf/transport.hpp"
 #include "harness.hpp"
 #include "testing.hpp"
 
@@ -325,4 +330,45 @@ CF_TEST(adversarial, pending_records_survive_and_apply_in_order) {
   if (latest != nullptr) {
     CF_EXPECT_EQ(latest->generation.value(), std::uint64_t{2});
   }
+}
+
+CF_TEST(restart, an_atomic_write_waits_for_a_reader_to_close) {
+  cf::test::TempDir directory("store-atomic-reader");
+  const std::string path = (std::filesystem::path(directory.path()) / "state.bin").string();
+  const std::vector<std::uint8_t> first = {1, 2, 3};
+  const std::vector<std::uint8_t> second = {4, 5, 6, 7};
+  CF_EXPECT(static_cast<bool>(cf::writeFileAtomic(path, first)));
+  bool reader_opened = false;
+  bool written = false;
+  {
+    // Another tool reading the store (an inspection, a scan) holds the file
+    // open while it is replaced, and closes it shortly after.
+    std::ifstream reader(path, std::ios::binary);
+    reader_opened = reader.is_open();
+    std::thread writer([&path, &second, &written] {
+      written = static_cast<bool>(cf::writeFileAtomic(path, second));
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    reader.close();
+    writer.join();
+  }
+  CF_EXPECT(reader_opened);
+  // The replacement waits for the reader instead of failing the write.
+  CF_EXPECT(written);
+  const auto stored = cf::readFileBounded(path, 64);
+  CF_EXPECT(static_cast<bool>(stored));
+  if (stored) {
+    CF_EXPECT(stored.value() == second);
+  }
+}
+
+CF_TEST(adversarial, a_second_listener_cannot_take_a_listening_port) {
+  auto first = cf::Listener::bindTcp("127.0.0.1", 0, 8);
+  CF_EXPECT(static_cast<bool>(first));
+  if (!first) {
+    return;
+  }
+  auto second = cf::Listener::bindTcp("127.0.0.1", first.value()->port(), 8);
+  // Two controllers must never share one listening port: the second bind fails.
+  CF_EXPECT(!second);
 }

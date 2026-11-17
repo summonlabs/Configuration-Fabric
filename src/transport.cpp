@@ -495,8 +495,15 @@ Result<std::unique_ptr<Listener>> Listener::bindTcp(const std::string& host, std
       continue;
     }
     const int enable = 1;
+#if defined(_WIN32)
+    // SO_REUSEADDR on Windows lets a second socket bind a port that is still
+    // listening; exclusive use makes that second bind fail instead.
+    ::setsockopt(handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&enable),
+                 sizeof(enable));
+#else
     ::setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&enable),
                  sizeof(enable));
+#endif
     if (::bind(handle, candidate->ai_addr, static_cast<socklen_t>(candidate->ai_addrlen)) != 0) {
       failure = mapSocketError(lastSocketErrorCode(), ErrorCode::OpenFailed,
                                "cannot bind listen socket");
