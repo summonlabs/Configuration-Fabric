@@ -208,6 +208,9 @@ class Distributor final {
   /// observed restart and the reason is recorded as evidence.
   [[nodiscard]] Status rearmAfterRestart(const TargetId& target, Term newTerm);
   [[nodiscard]] Status applyReconcileReport(const SessionContext& session);
+  // The control session registers its connection so that stop() reaches it.
+  friend Status serveControlConnection(Distributor& distributor, Socket socket,
+                                       const HmacKey& key);
   void registerConnection(const std::shared_ptr<FramedConnection>& connection);
   void unregisterConnection(FramedConnection* connection);
   [[nodiscard]] bool stopRequested() const;

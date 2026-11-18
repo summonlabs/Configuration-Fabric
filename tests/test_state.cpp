@@ -5,11 +5,18 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "cf/codec.hpp"
+#include "cf/distributor.hpp"
+#include "cf/frame.hpp"
+#include "cf/ids.hpp"
+#include "cf/log.hpp"
+#include "cf/protocol.hpp"
 #include "cf/rng.hpp"
 #include "cf/state.hpp"
 #include "cf/store.hpp"
@@ -371,4 +378,55 @@ CF_TEST(adversarial, a_second_listener_cannot_take_a_listening_port) {
   auto second = cf::Listener::bindTcp("127.0.0.1", first.value()->port(), 8);
   // Two controllers must never share one listening port: the second bind fails.
   CF_EXPECT(!second);
+}
+
+CF_TEST(concurrency, stop_does_not_wait_for_an_idle_control_client) {
+  cf::test::TempDir directory("stop-control");
+  cf::Distributor::Options options;
+  options.nodeId = cf::parseNodeId("stop-ctl").value();
+  options.stateDirectory = directory.child("state");
+  options.artifactRoot = directory.child("artifacts");
+  options.authenticate = false;
+  options.controlHost = "127.0.0.1";
+  options.controlPort = 0;
+  cf::Distributor::Recovery recovery;
+  auto opened = cf::Distributor::open(options, recovery);
+  CF_REQUIRE_OK(opened);
+  std::unique_ptr<cf::Distributor> distributor = std::move(opened).value();
+  CF_REQUIRE_OK(distributor->start());
+
+  // An operator's control client that has finished its hello and sits idle:
+  // the acknowledgement proves the control thread is serving it.
+  bool acknowledged = false;
+  std::unique_ptr<cf::FramedConnection> client;
+  auto socket = cf::connectTcp("127.0.0.1", distributor->controlPort(), 5000);
+  if (socket) {
+    client = std::make_unique<cf::FramedConnection>(std::move(socket).value(),
+                                                    cf::kDefaultMaxPayloadBytes);
+    cf::ControlHelloMessage hello;
+    hello.clientName = "idle-operator";
+    hello.nonce = cf::SessionNonce(cf::secureRandom128());
+    const std::int64_t deadline = cf::monotonicMillis() + 5000;
+    auto helloBytes = cf::encodeControlHello(hello);
+    if (helloBytes &&
+        client->send(cf::FrameType::ControlHello, 0, helloBytes.value(), deadline)) {
+      auto ack = client->receive(deadline);
+      acknowledged = ack && ack.value().type() == cf::FrameType::ControlHelloAck;
+    }
+  }
+
+  // stop() runs on a helper thread, so a stop() that waits on the idle client
+  // is observed instead of hanging the suite; closing the client releases it.
+  std::promise<void> stopped;
+  std::future<void> done = stopped.get_future();
+  std::thread stopper([&distributor, &stopped] {
+    distributor->stop();
+    stopped.set_value();
+  });
+  const bool returned = done.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+  client.reset();
+  stopper.join();
+  CF_EXPECT(acknowledged);
+  // stop() interrupts the control connection like every other live connection.
+  CF_EXPECT(returned);
 }

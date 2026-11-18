@@ -390,8 +390,12 @@ Result<std::string> executeControlCommand(Distributor& distributor,
   return Result<std::string>::fail(ErrorCode::NotFound, "unknown control command", command);
 }
 
-Status serveControlConnection(Distributor& distributor, Socket socket, const HmacKey& key) {
-  auto connection = std::make_shared<FramedConnection>(std::move(socket), kDefaultMaxPayloadBytes);
+namespace {
+
+// Serves one control session on a connection the distributor has registered.
+Status serveControlSession(Distributor& distributor,
+                           const std::shared_ptr<FramedConnection>& connection,
+                           const HmacKey& key) {
   const std::int64_t deadline = monotonicMillis() + kControlBudgetMillis;
 
   auto helloFrame = connection->receive(deadline);
@@ -457,6 +461,20 @@ Status serveControlConnection(Distributor& distributor, Socket socket, const Hma
       return Status::ok();
     }
   }
+}
+
+}  // namespace
+
+Status serveControlConnection(Distributor& distributor, Socket socket, const HmacKey& key) {
+  auto connection = std::make_shared<FramedConnection>(std::move(socket), kDefaultMaxPayloadBytes);
+  // stop() interrupts the connections the distributor has registered. The
+  // control connection was not registered, so stop() waited for the control
+  // client: up to the 30 s read budget while it sat idle, and indefinitely
+  // while it kept sending requests.
+  distributor.registerConnection(connection);
+  const Status served = serveControlSession(distributor, connection, key);
+  distributor.unregisterConnection(connection.get());
+  return served;
 }
 
 Result<std::string> runControlCommand(const Endpoint& endpoint, const HmacKey& key,

@@ -220,6 +220,13 @@ void Distributor::stop() {
 
 void Distributor::registerConnection(const std::shared_ptr<FramedConnection>& connection) {
   std::lock_guard<std::mutex> guard(connectionsMutex_);
+  // stop() interrupts the connections it finds here. One registered after that
+  // pass would never be interrupted and stop() would wait out its read budget,
+  // so a connection that registers once stop() has begun is interrupted now.
+  if (stopRequested_.load(std::memory_order_relaxed)) {
+    connection->interrupt();
+    return;
+  }
   connections_.push_back(connection);
 }
 
